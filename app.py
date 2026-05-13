@@ -431,8 +431,10 @@ async function startResearch(){
         body:JSON.stringify({desc:items[i].desc,unit:items[i].unit})
       });
       if(!res.ok){
-        const err=await res.json().catch(()=>({}));
-        throw new Error(err.error||'HTTP '+res.status);
+        // Tenta extrair mensagem de erro real do servidor
+        let errMsg = 'HTTP '+res.status;
+        try { const e=await res.json(); errMsg = e.error || errMsg; } catch(_){}
+        throw new Error(errMsg);
       }
       const data=await res.json();
       items[i].price1=data.price1; items[i].src1=data.src1;
@@ -442,18 +444,27 @@ async function startResearch(){
     }catch(err){
       console.error('Item',i,err);
       items[i].status='error';
+      items[i].errorMsg = err.message || 'Erro desconhecido';
     }
     render();
     await new Promise(r=>setTimeout(r,200));
   }
 
   pfill.style.width='100%';
-  plab.textContent='✓ Pesquisa concluída!';
-  setTimeout(()=>prog.classList.remove('on'),2500);
+  const erros = items.filter(x=>x.status==='error');
+  if(erros.length===0){
+    plab.textContent='✓ Pesquisa concluída com sucesso!';
+    toast('Pesquisa concluída!','ok');
+  } else {
+    plab.textContent='⚠ Concluído com '+erros.length+' erro(s). Veja os itens marcados em vermelho.';
+    // Mostra o erro do primeiro item para diagnóstico
+    const msg = erros[0].errorMsg || 'Verifique os logs do servidor.';
+    toast('Erro na pesquisa: '+msg.substring(0,120),'err');
+  }
+  setTimeout(()=>prog.classList.remove('on'),5000);
   btn.disabled=false;
   researchDone=true;
   render();
-  toast('Pesquisa concluída!','ok');
 }
 
 /* ── Gerar PDF ── */
@@ -495,65 +506,108 @@ render();
 
 # ─── API: pesquisa de preços ─────────────────────────────────────────────────
 
+@app.route('/api/test', methods=['GET'])
+def test_api():
+    """Rota de diagnóstico — acesse /api/test no navegador para verificar a configuração."""
+    try:
+        import anthropic
+    except ImportError:
+        return jsonify({'ok': False, 'error': 'Biblioteca anthropic não instalada. Execute: pip install anthropic'}), 500
+
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'ANTHROPIC_API_KEY não configurada no servidor.'}), 500
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{"role": "user", "content": "ping"}]
+        )
+        return jsonify({'ok': True, 'message': 'Conexão com a API funcionando corretamente.'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 @app.route('/api/research', methods=['POST'])
 def research():
+    # ── Verificações de ambiente ──────────────────────────────────────────────
     try:
         import anthropic
     except ImportError:
         return jsonify({'error': 'Biblioteca anthropic não instalada. Execute: pip install anthropic'}), 500
 
-    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
     if not api_key:
-        return jsonify({'error': 'Variável ANTHROPIC_API_KEY não definida.'}), 500
+        return jsonify({'error': 'ANTHROPIC_API_KEY não configurada no servidor. Verifique as variáveis de ambiente no Render.'}), 500
 
-    data = request.get_json()
-    desc = data.get('desc', '')
-    unit = data.get('unit', 'un')
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'error': 'Requisição inválida — corpo JSON ausente.'}), 400
 
-    client = anthropic.Anthropic(api_key=api_key)
+    desc = data.get('desc', '').strip()
+    unit = data.get('unit', 'un').strip()
+    if not desc:
+        return jsonify({'error': 'Descrição do item não informada.'}), 400
 
-    system = (
-        "Você é um assistente especializado em pesquisa de preços para contratações públicas no Brasil, "
-        "seguindo a IN SEGES/ME nº 65/2021 e a Lei nº 14.133/2021.\n\n"
-        "Para cada item, forneça EXATAMENTE 3 preços unitários de fontes distintas.\n\n"
-        "REGRAS:\n"
-        "1. Apenas fornecedores PJ com emissão de NF-e.\n"
-        "2. NÃO inclua pessoas físicas, produtos usados ou seminovos.\n"
-        "3. Mercado Livre/Amazon: só vendedores PJ com NF-e.\n"
-        "4. Priorize: Painel de Preços, ComprasNet/PNCP, depois grandes varejistas.\n"
-        "5. Preços realistas para o mercado brasileiro em " + str(datetime.now().year) + ".\n"
-        "6. Responda SOMENTE com JSON puro, sem markdown, sem texto adicional.\n\n"
-        'Formato: {"price1":12.50,"src1":"Nome Fonte 1","price2":13.80,"src2":"Nome Fonte 2","price3":11.90,"src3":"Nome Fonte 3"}'
-    )
+    # ── Chamada à API da Anthropic ────────────────────────────────────────────
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
 
-    user = (
-        f"Pesquise 3 preços unitários para o seguinte item de contratação pública do IFAL:\n"
-        f"Descrição: {desc}\n"
-        f"Unidade: {unit}\n"
-        f"Forneça o valor unitário (por {unit}) em R$ de 3 fornecedores PJ distintos com NF-e."
-    )
+        system = (
+            "Você é um assistente especializado em pesquisa de preços para contratações públicas no Brasil, "
+            "seguindo a IN SEGES/ME nº 65/2021 e a Lei nº 14.133/2021.\n\n"
+            "Para cada item, forneça EXATAMENTE 3 preços unitários de fontes distintas.\n\n"
+            "REGRAS:\n"
+            "1. Apenas fornecedores PJ com emissão de NF-e.\n"
+            "2. NÃO inclua pessoas físicas, produtos usados ou seminovos.\n"
+            "3. Mercado Livre/Amazon: só vendedores PJ com NF-e.\n"
+            "4. Priorize: Painel de Preços, ComprasNet/PNCP, depois grandes varejistas.\n"
+            f"5. Preços realistas para o mercado brasileiro em {datetime.now().year}.\n"
+            "6. Responda SOMENTE com JSON puro, sem markdown, sem texto adicional.\n\n"
+            'Formato exato: {"price1":12.50,"src1":"Nome Fonte 1","price2":13.80,"src2":"Nome Fonte 2","price3":11.90,"src3":"Nome Fonte 3"}'
+        )
 
-    message = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=300,
-        system=system,
-        messages=[{"role": "user", "content": user}]
-    )
+        user = (
+            f"Pesquise 3 preços unitários para o seguinte item de contratação pública do IFAL:\n"
+            f"Descrição: {desc}\n"
+            f"Unidade de medida: {unit}\n"
+            f"Forneça o valor unitário (por {unit}) em R$ de 3 fornecedores PJ distintos com NF-e."
+        )
 
-    raw = "".join(b.text for b in message.content if b.type == "text")
-    m = re.search(r'\{[\s\S]*\}', raw)
-    if not m:
-        return jsonify({'error': 'Resposta inválida da IA: ' + raw[:100]}), 500
+        # CORREÇÃO PRINCIPAL: nome do modelo correto
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=system,
+            messages=[{"role": "user", "content": user}]
+        )
 
-    parsed = json.loads(m.group(0))
-    return jsonify({
-        'price1': float(parsed.get('price1') or 0),
-        'src1':   str(parsed.get('src1') or 'Fonte 1')[:80],
-        'price2': float(parsed.get('price2') or 0),
-        'src2':   str(parsed.get('src2') or 'Fonte 2')[:80],
-        'price3': float(parsed.get('price3') or 0),
-        'src3':   str(parsed.get('src3') or 'Fonte 3')[:80],
-    })
+    except Exception as e:
+        # Retorna o erro real para o frontend poder exibir
+        return jsonify({'error': f'Erro na chamada à API Anthropic: {str(e)}'}), 500
+
+    # ── Extrai e valida o JSON da resposta ────────────────────────────────────
+    try:
+        raw = "".join(b.text for b in message.content if b.type == "text")
+        m = re.search(r'\{[\s\S]*?\}', raw)
+        if not m:
+            return jsonify({'error': f'IA não retornou JSON válido. Resposta recebida: {raw[:150]}'}), 500
+
+        parsed = json.loads(m.group(0))
+
+        return jsonify({
+            'price1': float(parsed.get('price1') or 0),
+            'src1':   str(parsed.get('src1') or 'Fonte 1')[:80],
+            'price2': float(parsed.get('price2') or 0),
+            'src2':   str(parsed.get('src2') or 'Fonte 2')[:80],
+            'price3': float(parsed.get('price3') or 0),
+            'src3':   str(parsed.get('src3') or 'Fonte 3')[:80],
+        })
+
+    except (json.JSONDecodeError, ValueError) as e:
+        return jsonify({'error': f'Erro ao processar resposta da IA: {str(e)}. Resposta: {raw[:150]}'}), 500
 
 
 # ─── API: geração de PDF ─────────────────────────────────────────────────────
@@ -828,5 +882,4 @@ if __name__ == '__main__':
         print(f'  ✓  API Key configurada.')
     print('  🌐  Acesse o sistema em: http://localhost:5000')
     print()
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(debug=False, port=5000)
